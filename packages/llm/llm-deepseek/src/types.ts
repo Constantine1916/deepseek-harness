@@ -91,14 +91,14 @@ export interface WireTool {
 
 /** One parsed SSE `data:` payload (a chat.completion.chunk). */
 export interface WireChunk {
-  choices?: WireChoice[]
+  choices?: WireChoice[] | null
   /** Arrives attached to the finish chunk and/or as a trailing usage-only chunk. */
   usage?: WireUsage | null
 }
 
 /** One streamed choice (requests always ask for a single one); `finish_reason` is non-null only on its terminal chunk. */
 export interface WireChoice {
-  delta?: WireDelta
+  delta?: WireDelta | null
   finish_reason?: string | null
 }
 
@@ -112,13 +112,13 @@ export interface WireDelta {
    * open a reasoning block); absent entirely in non-thinking mode.
    */
   reasoning_content?: string | null
-  tool_calls?: WireToolCallDelta[]
+  tool_calls?: WireToolCallDelta[] | null
 }
 
 /** A streamed fragment of one tool call; fragments sharing an `index` concatenate into one call. */
 export interface WireToolCallDelta {
   /** Disambiguates parallel tool calls; stable across a call's deltas. */
-  index: number
+  index?: number | null
   /** The first non-empty string identifies the call; continuation deltas may omit it or send null. */
   id?: string | null
   type?: 'function'
@@ -126,8 +126,8 @@ export interface WireToolCallDelta {
     /** The first non-empty string names the tool; continuation deltas may omit it or send null. */
     name?: string | null
     /** Argument JSON fragment (concatenate across deltas). */
-    arguments?: string
-  }
+    arguments?: string | null
+  } | null
 }
 
 /**
@@ -138,12 +138,12 @@ export interface WireToolCallDelta {
  * hit count.
  */
 export interface WireUsage {
-  prompt_tokens: number
-  completion_tokens: number
-  prompt_cache_hit_tokens?: number
-  prompt_cache_miss_tokens?: number
-  prompt_tokens_details?: { cached_tokens?: number }
-  completion_tokens_details?: { reasoning_tokens?: number }
+  prompt_tokens?: number | null
+  completion_tokens?: number | null
+  prompt_cache_hit_tokens?: number | null
+  prompt_cache_miss_tokens?: number | null
+  prompt_tokens_details?: { cached_tokens?: number | null } | null
+  completion_tokens_details?: { reasoning_tokens?: number | null } | null
 }
 
 /** Non-2xx error body. */
