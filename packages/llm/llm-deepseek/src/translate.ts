@@ -1,9 +1,9 @@
 /**
  * Translate DeepSeek SSE payloads with one stateful harness block per content, reasoning, or tool
- * call index. An empty initial reasoning delta does not open a block, and an empty continuation
- * tool name does not erase the established name. Finish reason and the latest usage are deferred
- * until `[DONE]`, covering both finish-attached and trailing usage-only shapes while ensuring no
- * chunk follows `finish`.
+ * call index. An empty initial reasoning delta does not open a block, and empty or null continuation
+ * tool identity fields do not erase established values. Finish reason and the latest usage are
+ * deferred until `[DONE]`, covering both finish-attached and trailing usage-only shapes while
+ * ensuring no chunk follows `finish`.
  *
  * Translate DeepSeek wire chunks into the harness `StreamChunk` protocol.
  * @module dsh-llm-deepseek/translate
@@ -157,7 +157,8 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
           toolBlocks.set(call.index, block)
           yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
         }
-        if (call.id !== undefined) block.callId = call.id
+        const id = call.id
+        if (typeof id === 'string' && id.length > 0) block.callId = id
         const name = call.function?.name
         if (typeof name === 'string' && name.length > 0) block.name = name
         const fragment = call.function?.arguments ?? ''
