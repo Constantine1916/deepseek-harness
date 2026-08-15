@@ -123,17 +123,19 @@ describe('translate: tool calls', () => {
     ])
   })
 
-  it('preserves an established tool name across empty continuation names', async () => {
+  it('preserves established tool identity across empty and null continuation fields', async () => {
     const chunks = await collect(translate(feed(
       firstChunk,
-      { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_bash', type: 'function', function: { name: 'bash', arguments: '{"command":' } }] } }] },
-      { choices: [{ delta: { tool_calls: [{ index: 0, function: { name: '', arguments: '"pwd"}' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_bash', type: 'function', function: { name: 'bash', arguments: '{"command"' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: '', function: { name: '', arguments: ':"pwd"' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: null, function: { name: null, arguments: '}' } }] } }] },
       { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
       DONE,
     )))
     expect(chunks.filter(chunk => chunk.type === 'tool-call-delta')).toEqual([
-      { type: 'tool-call-delta', index: 0, id: 'call_bash', name: 'bash', argumentsDelta: '{"command":' },
-      { type: 'tool-call-delta', index: 0, id: 'call_bash', name: 'bash', argumentsDelta: '"pwd"}' },
+      { type: 'tool-call-delta', index: 0, id: 'call_bash', name: 'bash', argumentsDelta: '{"command"' },
+      { type: 'tool-call-delta', index: 0, id: 'call_bash', name: 'bash', argumentsDelta: ':"pwd"' },
+      { type: 'tool-call-delta', index: 0, id: 'call_bash', name: 'bash', argumentsDelta: '}' },
     ])
     expect(chunks.find(chunk => chunk.type === 'block-end')).toEqual({
       type: 'block-end',
