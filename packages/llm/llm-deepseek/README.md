@@ -69,6 +69,7 @@ DeepSeek request identity is separate from app attribution. After credential res
 - Streaming only (`stream_options.include_usage` always on). `usage` may arrive attached to the finish chunk or as a trailing usage-only chunk — the translator defers both to `[DONE]`, so `usage` always precedes `finish` and nothing follows `finish`.
 - The adapter-owned `off` effort maps to `thinking: {type: 'disabled'}` and never crosses the wire as `reasoning_effort: 'off'`.
 - The first thinking-mode chunk carries `reasoning_content: ""` — handled (no spurious reasoning block).
+- Tool-call deltas sharing an index assemble into one call; an empty continuation `name` does not erase an established tool name.
 - **Reasoning passback rule**: on assistant turns that carried tool calls, `reasoning_content` is serialized back in history (required by the API in thinking mode); on tool-call-free turns it is dropped (ignored anyway — saves tokens).
 - Cache accounting: `cacheReadTokens` ← `prompt_cache_hit_tokens` / `prompt_tokens_details.cached_tokens`; DeepSeek reports no cache-write metric.
 
