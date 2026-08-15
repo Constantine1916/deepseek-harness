@@ -123,6 +123,25 @@ describe('translate: tool calls', () => {
     ])
   })
 
+  it('preserves an established tool name across empty continuation names', async () => {
+    const chunks = await collect(translate(feed(
+      firstChunk,
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_bash', type: 'function', function: { name: 'bash', arguments: '{"command":' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, function: { name: '', arguments: '"pwd"}' } }] } }] },
+      { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+      DONE,
+    )))
+    expect(chunks.filter(chunk => chunk.type === 'tool-call-delta')).toEqual([
+      { type: 'tool-call-delta', index: 0, id: 'call_bash', name: 'bash', argumentsDelta: '{"command":' },
+      { type: 'tool-call-delta', index: 0, id: 'call_bash', name: 'bash', argumentsDelta: '"pwd"}' },
+    ])
+    expect(chunks.find(chunk => chunk.type === 'block-end')).toEqual({
+      type: 'block-end',
+      index: 0,
+      block: { type: 'tool-call', id: 'call_bash', name: 'bash', arguments: '{"command":"pwd"}' },
+    })
+  })
+
   it('disambiguates parallel tool calls by wire index', async () => {
     const chunks = await collect(translate(feed(
       firstChunk,
