@@ -1,9 +1,10 @@
 /**
  * Translate DeepSeek SSE payloads with one stateful harness block per content, reasoning, or tool
  * call index. An empty initial reasoning delta does not open a block, and empty or null continuation
- * tool identity fields do not erase established values. Finish reason and the latest usage are
- * deferred until `[DONE]`, covering both finish-attached and trailing usage-only shapes while
- * ensuring no chunk follows `finish`.
+ * tool identity fields do not erase established values. Tool-call identity, indices, argument
+ * fragments, and token counts are validated before they become completed harness values. Finish
+ * reason and the latest usage are deferred until `[DONE]`, covering both finish-attached and trailing
+ * usage-only shapes while ensuring no chunk follows `finish`.
  *
  * Translate DeepSeek wire chunks into the harness `StreamChunk` protocol.
  * @module dsh-llm-deepseek/translate
@@ -43,6 +44,33 @@ export function mapFinishReason(reason: string): FinishReason {
   }
 }
 
+/** Throw the provider-neutral classification for an invalid DeepSeek response field. */
+function malformedResponse(message: string): never {
+  throw new LlmError(`malformed DeepSeek response: ${message}`, 'MALFORMED_RESPONSE')
+}
+
+/** Validate one token-count field received from the provider. */
+function tokenCount(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    malformedResponse(`${field} must be a nonnegative safe integer`)
+  }
+  return value
+}
+
+/** Validate one optional token-count field, treating null as absent. */
+function optionalTokenCount(value: unknown, field: string): number | undefined {
+  return value === undefined || value === null ? undefined : tokenCount(value, field)
+}
+
+/** Read and validate one optional nested usage count. */
+function optionalUsageDetail(container: unknown, containerField: string, field: string): number | undefined {
+  if (container === undefined || container === null) return undefined
+  if (typeof container !== 'object' || Array.isArray(container)) {
+    malformedResponse(`${containerField} must be an object or null`)
+  }
+  return optionalTokenCount((container as Record<string, unknown>)[field], `${containerField}.${field}`)
+}
+
 /**
  * Map wire usage fields. DeepSeek's `prompt_tokens` INCLUDES cache hits
  * (`prompt_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens`,
@@ -50,13 +78,30 @@ export function mapFinishReason(reason: string): FinishReason {
  * DISJOINT counts, so cache reads are subtracted out of `inputTokens`.
  * @param usage - wire usage from the finish chunk or the trailing usage-only chunk.
  * @returns disjoint harness counts; cache/reasoning fields present only when the wire reported them.
+ * @throws LlmError with `MALFORMED_RESPONSE` when a count is not a nonnegative safe integer or cache
+ *   reads exceed total prompt tokens.
  */
 export function mapUsage(usage: WireUsage): TokenUsage {
-  const cacheRead = usage.prompt_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens
-  const reasoning = usage.completion_tokens_details?.reasoning_tokens
+  const promptTokens = tokenCount(usage.prompt_tokens, 'usage.prompt_tokens')
+  const completionTokens = tokenCount(usage.completion_tokens, 'usage.completion_tokens')
+  const detailedCacheRead = optionalUsageDetail(
+    usage.prompt_tokens_details,
+    'usage.prompt_tokens_details',
+    'cached_tokens',
+  )
+  const cacheRead = detailedCacheRead
+    ?? optionalTokenCount(usage.prompt_cache_hit_tokens, 'usage.prompt_cache_hit_tokens')
+  const reasoning = optionalUsageDetail(
+    usage.completion_tokens_details,
+    'usage.completion_tokens_details',
+    'reasoning_tokens',
+  )
+  if (cacheRead !== undefined && cacheRead > promptTokens) {
+    malformedResponse('usage cache-read tokens cannot exceed usage.prompt_tokens')
+  }
   return {
-    inputTokens: usage.prompt_tokens - (cacheRead ?? 0),
-    outputTokens: usage.completion_tokens,
+    inputTokens: promptTokens - (cacheRead ?? 0),
+    outputTokens: completionTokens,
     ...cacheRead !== undefined ? { cacheReadTokens: cacheRead } : {},
     ...reasoning !== undefined ? { reasoningTokens: reasoning } : {},
   }
@@ -67,18 +112,27 @@ function closeBlock(block: OpenBlock): ContentBlock {
   switch (block.kind) {
     case 'text': return { type: 'text', text: block.text }
     case 'reasoning': return { type: 'reasoning', text: block.text }
-    case 'tool-call': return {
-      type: 'tool-call',
-      id: CallId(block.callId ?? ''),
-      name: block.name ?? '',
-      arguments: block.text,
+    case 'tool-call': {
+      if (block.callId === undefined || block.name === undefined) {
+        const missing = [block.callId === undefined ? 'id' : undefined, block.name === undefined ? 'name' : undefined]
+          .filter(value => value !== undefined)
+          .join(' and ')
+        malformedResponse(`tool call never provided a non-empty ${missing}`)
+      }
+      return {
+        type: 'tool-call',
+        id: CallId(block.callId),
+        name: block.name,
+        arguments: block.text,
+      }
     }
   }
 }
 
 /**
  * Consume SSE data payloads (ending with `[DONE]`) and yield StreamChunks.
- * Malformed JSON payloads abort the stream with `MALFORMED_RESPONSE`.
+ * Malformed JSON payloads and invalid tool-call or usage fields abort the stream with
+ * `MALFORMED_RESPONSE`.
  * @param payloads - SSE data payloads from {@link parseSse}, `[DONE]`-terminated.
  * @returns deltas as they arrive; `block-end`s, `usage`, and `finish` are all deferred to the `[DONE]` sentinel.
  *   A `stop` (or absent) finish with no opened blocks is a degenerate provider completion and maps to an
@@ -101,8 +155,9 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
 
   for await (const payload of payloads) {
     if (payload === DONE) {
-      for (const block of order) {
-        yield { type: 'block-end', index: block.index, block: closeBlock(block) }
+      const completed = order.map(block => ({ open: block, content: closeBlock(block) }))
+      for (const block of completed) {
+        yield { type: 'block-end', index: block.open.index, block: block.content }
       }
       if (pendingUsage) yield { type: 'usage', usage: pendingUsage }
       const reason = pendingFinish ?? { kind: 'stop' as const }
@@ -151,17 +206,31 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
       }
 
       for (const call of delta?.tool_calls ?? []) {
-        let block = toolBlocks.get(call.index)
+        const wireIndex: unknown = call.index
+        if (typeof wireIndex !== 'number' || !Number.isSafeInteger(wireIndex) || wireIndex < 0) {
+          malformedResponse('tool_calls[].index must be a nonnegative safe integer')
+        }
+        let block = toolBlocks.get(wireIndex)
         if (!block) {
           block = open('tool-call')
-          toolBlocks.set(call.index, block)
+          toolBlocks.set(wireIndex, block)
           yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
         }
-        const id = call.id
+        const id: unknown = call.id
+        if (id !== undefined && id !== null && typeof id !== 'string') {
+          malformedResponse('tool_calls[].id must be a string or null')
+        }
         if (typeof id === 'string' && id.length > 0) block.callId = id
-        const name = call.function?.name
+        const name: unknown = call.function?.name
+        if (name !== undefined && name !== null && typeof name !== 'string') {
+          malformedResponse('tool_calls[].function.name must be a string or null')
+        }
         if (typeof name === 'string' && name.length > 0) block.name = name
-        const fragment = call.function?.arguments ?? ''
+        const argumentValue: unknown = call.function?.arguments
+        if (argumentValue !== undefined && argumentValue !== null && typeof argumentValue !== 'string') {
+          malformedResponse('tool_calls[].function.arguments must be a string or null')
+        }
+        const fragment = typeof argumentValue === 'string' ? argumentValue : ''
         block.text += fragment
         yield {
           type: 'tool-call-delta',

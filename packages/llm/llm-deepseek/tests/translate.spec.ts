@@ -3,6 +3,7 @@ import { BlockAssembler, EMPTY_RESPONSE_CODE, LlmError } from '@deepseek-ai/dsh-
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { DONE } from '../src/sse.ts'
 import { mapFinishReason, mapUsage, translate } from '../src/translate.ts'
+import type { WireUsage } from '../src/types.ts'
 
 async function* feed(...payloads: (string | object)[]): AsyncGenerator<string> {
   for (const payload of payloads) {
@@ -14,6 +15,20 @@ async function collect(stream: AsyncIterable<StreamChunk>): Promise<StreamChunk[
   const out: StreamChunk[] = []
   for await (const chunk of stream) out.push(chunk)
   return out
+}
+
+async function expectMalformed(...payloads: (string | object)[]): Promise<void> {
+  await expect(collect(translate(feed(...payloads)))).rejects.toMatchObject({ code: 'MALFORMED_RESPONSE' })
+}
+
+function expectMalformedUsage(usage: WireUsage): void {
+  try {
+    mapUsage(usage)
+    throw new Error('expected mapUsage to reject malformed wire usage')
+  } catch (error) {
+    expect(error).toBeInstanceOf(LlmError)
+    expect(error).toMatchObject({ code: 'MALFORMED_RESPONSE' })
+  }
 }
 
 /** The live first-chunk signature: role + null content + EMPTY reasoning. */
@@ -330,23 +345,123 @@ describe('mapUsage', () => {
     expect(mapUsage({ prompt_tokens: 10, completion_tokens: 2 }))
       .toEqual({ inputTokens: 10, outputTokens: 2 })
   })
+
+  it('treats null optional counts and detail containers as absent', () => {
+    expect(mapUsage({
+      prompt_tokens: 10,
+      completion_tokens: 2,
+      prompt_cache_hit_tokens: null,
+      prompt_tokens_details: { cached_tokens: null },
+      completion_tokens_details: null,
+    })).toEqual({ inputTokens: 10, outputTokens: 2 })
+  })
+
+  it('falls back to the legacy cache field when the detail count is null', () => {
+    expect(mapUsage({
+      prompt_tokens: 10,
+      completion_tokens: 2,
+      prompt_cache_hit_tokens: 3,
+      prompt_tokens_details: { cached_tokens: null },
+      completion_tokens_details: { reasoning_tokens: null },
+    })).toEqual({ inputTokens: 7, outputTokens: 2, cacheReadTokens: 3 })
+  })
+
+  it.each(['prompt_tokens', 'completion_tokens'] as const)(
+    'rejects missing or invalid required %s counts',
+    (field) => {
+      for (const value of [undefined, null, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '10']) {
+        expectMalformedUsage({
+          prompt_tokens: field === 'prompt_tokens' ? value : 10,
+          completion_tokens: field === 'completion_tokens' ? value : 2,
+        } as unknown as WireUsage)
+      }
+    },
+  )
+
+  it('rejects invalid optional token counts', () => {
+    for (const usage of [
+      { prompt_tokens: 10, completion_tokens: 2, prompt_cache_hit_tokens: -1 },
+      { prompt_tokens: 10, completion_tokens: 2, prompt_tokens_details: { cached_tokens: 1.5 } },
+      { prompt_tokens: 10, completion_tokens: 2, completion_tokens_details: { reasoning_tokens: '1' } },
+    ]) {
+      expectMalformedUsage(usage as unknown as WireUsage)
+    }
+  })
+
+  it('rejects invalid optional usage detail containers', () => {
+    for (const container of [1, []]) {
+      expectMalformedUsage({
+        prompt_tokens: 10,
+        completion_tokens: 2,
+        prompt_tokens_details: container,
+      } as unknown as WireUsage)
+    }
+  })
+
+  it('rejects cache reads greater than total prompt tokens', () => {
+    expectMalformedUsage({ prompt_tokens: 10, completion_tokens: 2, prompt_cache_hit_tokens: 11 })
+  })
 })
 
 describe('translate: defensive tool-call branches', () => {
-  it('handles deltas that never carry id or name (empty-string fallbacks)', async () => {
-    const chunks = await collect(translate(feed(
+  it.each([
+    ['id and name', { index: 0, id: '', function: { name: '', arguments: '{}' } }],
+    ['id', { index: 0, function: { name: 'bash', arguments: '{}' } }],
+    ['name', { index: 0, id: 'call_bash', function: { arguments: '{}' } }],
+  ])('rejects a completed tool call that never provides a non-empty %s', async (_label, call) => {
+    await expectMalformed(
       firstChunk,
-      // Hypothetical lenient wire: argument fragments with no id/name at all.
-      { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{}' } }] } }] },
+      { choices: [{ delta: { tool_calls: [call] } }] },
+      { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+      DONE,
+    )
+  })
+
+  it.each([
+    ['missing', {}],
+    ['null', { index: null }],
+    ['negative', { index: -1 }],
+    ['fractional', { index: 0.5 }],
+    ['unsafe', { index: Number.MAX_SAFE_INTEGER + 1 }],
+  ])('rejects a %s tool-call index', async (_label, indexFields) => {
+    await expectMalformed({
+      choices: [{
+        delta: {
+          tool_calls: [{ ...indexFields, id: 'c', function: { name: 'f', arguments: '{}' } }],
+        },
+      }],
+    })
+  })
+
+  it.each([
+    ['id', { index: 0, id: 1, function: { name: 'f', arguments: '{}' } }],
+    ['name', { index: 0, id: 'c', function: { name: 1, arguments: '{}' } }],
+  ])('rejects a non-string tool-call %s', async (_label, call) => {
+    await expectMalformed({ choices: [{ delta: { tool_calls: [call] } }] })
+  })
+
+  it.each([1, {}])('rejects a non-string tool-call argument fragment', async (argumentsValue) => {
+    await expectMalformed({
+      choices: [{
+        delta: {
+          tool_calls: [{ index: 0, id: 'c', function: { name: 'f', arguments: argumentsValue } }],
+        },
+      }],
+    })
+  })
+
+  it('treats a null tool-call argument fragment as absent', async () => {
+    const chunks = await collect(translate(feed(
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: 'c', function: { name: 'f', arguments: null } }] } }] },
       { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
       DONE,
     )))
-    expect(chunks).toEqual([
-      { type: 'block-start', index: 0, blockType: 'tool-call' },
-      { type: 'tool-call-delta', index: 0, id: '', argumentsDelta: '{}' },
-      { type: 'block-end', index: 0, block: { type: 'tool-call', id: '', name: '', arguments: '{}' } },
-      { type: 'finish', reason: { kind: 'tool-calls' } },
-    ])
+    expect(chunks[1]).toEqual({ type: 'tool-call-delta', index: 0, id: 'c', name: 'f', argumentsDelta: '' })
+    expect(chunks[2]).toEqual({
+      type: 'block-end',
+      index: 0,
+      block: { type: 'tool-call', id: 'c', name: 'f', arguments: '' },
+    })
   })
 
   it('handles tool_call deltas with a function object but no arguments field', async () => {
@@ -359,13 +474,4 @@ describe('translate: defensive tool-call branches', () => {
     expect(chunks[1]).toEqual({ type: 'tool-call-delta', index: 0, id: 'c', name: 'f', argumentsDelta: '' })
   })
 
-  it('handles tool_call deltas with no function object at all', async () => {
-    const chunks = await collect(translate(feed(
-      firstChunk,
-      { choices: [{ delta: { tool_calls: [{ index: 0, id: 'c' }] } }] },
-      { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
-      DONE,
-    )))
-    expect(chunks[1]).toEqual({ type: 'tool-call-delta', index: 0, id: 'c', argumentsDelta: '' })
-  })
 })
